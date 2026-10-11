@@ -3,7 +3,7 @@ extern crate alloc;
 use core::hash::{Hash, Hasher};
 
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, hash_map::Entry};
 use rustc_hash::{FxBuildHasher, FxHasher};
 
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
@@ -22,8 +22,7 @@ use super::{node::GreenNodeHead, token::GreenTokenData};
 
 /// If `node.children() <= CHILDREN_CACHE_THRESHOLD`, we will not create
 /// a new [`GreenNode`], but instead lookup in the cache if this node is
-/// already present. If so we use the one in the cache, otherwise we insert
-/// this node into the cache.
+/// already present. Reuse requires matching children, not just a matching hash.
 const CHILDREN_CACHE_THRESHOLD: usize = 3;
 
 /// A `NodeCache` deduplicates identical tokens and small nodes during tree construction.
@@ -215,8 +214,8 @@ where
         self.interner.get_or_intern(text)
     }
 
-    /// Creates a [`GreenNode`] by looking inside the cache or inserting
-    /// a new node into the cache if it's a cache miss.
+    /// Reuses a node only when its immediate children match. A header collision
+    /// creates an uncached node, leaving the existing cache entry in place.
     #[inline]
     fn get_cached_node(
         &mut self,
@@ -230,10 +229,33 @@ where
             text_len,
             child_hash,
         };
-        self.nodes
-            .entry(head)
-            .or_insert_with_key(|head| GreenNode::from_head_and_children(head.clone(), children))
-            .clone()
+        match self.nodes.entry(head) {
+            Entry::Occupied(entry) => {
+                let cached = entry.get();
+                // A matching hash is only a candidate. Check immediate children
+                // without recursively comparing potentially deep subtrees.
+                // Separately allocated but equal child nodes may safely miss.
+                let same_children = cached.children().len() == children.len()
+                    && cached
+                        .children()
+                        .zip(children.as_slice())
+                        .all(|(cached, new)| match (cached, new) {
+                            (NodeOrToken::Node(a), NodeOrToken::Node(b)) => a.data.as_ptr() == b.data.as_ptr(),
+                            (NodeOrToken::Token(a), NodeOrToken::Token(b)) => a == b,
+                            _ => false,
+                        });
+                if same_children {
+                    cached.clone()
+                } else {
+                    // Keep the existing cache entry; a conservative miss is safe.
+                    GreenNode::from_head_and_children(entry.key().clone(), children)
+                }
+            }
+            Entry::Vacant(entry) => {
+                let node = GreenNode::from_head_and_children(entry.key().clone(), children);
+                entry.insert(node).clone()
+            }
+        }
     }
 
     fn token<S: Syntax>(&mut self, kind: S, text: Option<TokenKey>, len: u32) -> GreenToken {
@@ -642,3 +664,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
